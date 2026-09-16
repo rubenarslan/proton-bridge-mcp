@@ -1,2 +1,7 @@
-mcp[cli]
-pydantic
+# mcp 2.x is a breaking rename: `mcp.server.fastmcp.FastMCP` became
+# `mcp.server.mcpserver.MCPServer`, so an unbounded `mcp[cli]` resolves to a
+# release this server cannot import. Keep the upper bound until the server is
+# ported. The lower bound is the floor that carries the PYSEC-2026-3481/3482
+# fixes.
+mcp[cli]>=1.27.2,<2
+pydantic>=2.0

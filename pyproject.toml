@@ -58,7 +58,11 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "mcp[cli] >= 1.0",
+    # Upper bound is load-bearing, not caution: mcp 2.x renamed
+    # `mcp.server.fastmcp.FastMCP` to `mcp.server.mcpserver.MCPServer`, so an
+    # unbounded `mcp[cli]` installs a release this server cannot import. The
+    # lower bound is the floor carrying the PYSEC-2026-3481/3482 fixes.
+    "mcp[cli] >= 1.27.2, < 2",
     "pydantic >= 2.0",
 ]
 
