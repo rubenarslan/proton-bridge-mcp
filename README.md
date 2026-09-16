@@ -210,6 +210,15 @@ uv pip compile requirements.in --generate-hashes --python-version 3.10 -o requir
 uv pip compile requirements.in requirements-dev.in --generate-hashes \
     --python-version 3.10 -o requirements-dev.txt
 
+# Both commands above treat the pins already in the output file as
+# preferences, so they hold existing versions steady and only resolve what
+# changed in the .in file. To pull in new upstream releases -- which is what
+# a red `pip-audit` job wants -- add --upgrade to each:
+uv pip compile requirements.in --generate-hashes --python-version 3.10 \
+    --upgrade -o requirements.txt
+uv pip compile requirements.in requirements-dev.in --generate-hashes \
+    --python-version 3.10 --upgrade -o requirements-dev.txt
+
 # Quick syntax check on the two top-level Python files
 python3 -m compileall -q proton_bridge_mcp.py bootstrap.py
 
