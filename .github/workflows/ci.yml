@@ -10,11 +10,14 @@
 #                 runtime lockfile resolves and hashes match.
 #   - tests     : install requirements-dev.txt (a superset of the runtime
 #                 lockfile, also hash-pinned) and run the pytest suite over
-#                 the pure helpers in proton_bridge_mcp.py.
+#                 the helpers and gates in proton_bridge_mcp.py.
 #
-# The pytest suite covers only side-effect-free helpers (header decoding,
-# address parsing, body extraction, IMAP-search criteria construction). It
-# does not exercise IMAP/SMTP/Keychain paths, which need a running Bridge.
+# The pytest suite covers side-effect-free helpers (header decoding, address
+# parsing, body extraction, attachment resolution, IMAP-search criteria
+# construction), the `acknowledged` refusal paths, and the forward tool's
+# orchestration with its IMAP/SMTP seams stubbed. It opens no sockets and
+# does not exercise the real IMAP/SMTP/Keychain paths, which need a running
+# Bridge.
 #
 # Third-party actions are pinned to commit SHAs (not tags) so an action
 # author cannot silently re-tag a release with new code -- a real

@@ -31,11 +31,48 @@ Several other Proton MCP servers exist on GitHub. Most are functional and some h
 | `proton_search_emails`       | IMAP SEARCH (from / to / subject / body / date / flags)  | read-only       |
 | `proton_read_email`          | Full headers + text + (optional) HTML + attachments list | read-only       |
 | `proton_download_attachment` | Save a specific attachment to disk                       | destructive (writes to disk; requires `acknowledged=true`) |
+| `proton_forward_email`       | Forward a message, with its attachments, to new recipients | destructive (requires `acknowledged=true`) |
 | `proton_flag_email`          | Mark read/unread, flag/unflag                            | mutate          |
 | `proton_move_email`          | Move a message to another mailbox                        | mutate          |
 | `proton_delete_email`        | Move to Trash (or permanently expunge)                   | destructive (requires `acknowledged=true`) |
 | `proton_send_email`          | Send via Bridge SMTP, optional append-to-Sent            | destructive (requires `acknowledged=true`) |
-| `proton_create_draft`        | Save a draft in Drafts for manual review                 | destructive when addressed externally (requires `acknowledged=true` for non-self recipients) |
+| `proton_create_draft`        | Save a draft in Drafts for manual review                 | destructive when addressed externally or when carrying attachments (requires `acknowledged=true`) |
+
+### Attachments
+
+`proton_send_email` and `proton_create_draft` take attachments from two
+sources, and you can mix them in one message. `proton_forward_email` takes the
+first of the two, plus whatever it carries over from the message being
+forwarded.
+
+- `attachments`: a list of **absolute** paths to local files. Relative paths,
+  directories and globs are refused. Each file is read and sent outbound, so
+  this is an arbitrary-file-read that leaves the machine: it only ever runs
+  behind the `acknowledged=true` gate, and you can fence it off entirely with
+  `PROTON_BRIDGE_ATTACHMENT_ROOTS`.
+- `forward_attachments`: pointers to attachments on messages already in your
+  mailbox, as `{uid, mailbox, filename}` or `{uid, mailbox, index}`. Omit both
+  `filename` and `index` to take every attachment on that message. The bytes go
+  straight from IMAP into the outgoing message; nothing is written to disk, so
+  re-attaching a file you received costs no `proton_download_attachment` call.
+
+`index` is the 1-based position in the attachment list that `proton_read_email`
+reports, and is the way to disambiguate a message carrying two files with the
+same name. Selecting by `filename` takes *every* part with that name.
+
+`proton_forward_email` forwards inline by default: the original body is quoted
+under the usual `---------- Forwarded message ----------` block and its
+attachments are carried over. With `as_attachment=true` the original is instead
+hung off the forward as a single `message/rfc822` part, which preserves its
+headers and structure exactly. That is the right choice when the recipient
+needs to see the original as it arrived, say for reporting phishing or passing
+something to a lawyer. The forwarded body is sent verbatim; unlike the read
+path it is neither truncated nor stripped of invisible Unicode, because the
+recipient should get what the sender actually wrote. It is not echoed back into
+the model's context either: the tool returns metadata only.
+
+Attachments are capped at 20 per message and 18 MiB total (raw bytes, before
+base64 inflates them by about a third on the wire). Both are configurable.
 
 ## Hardening highlights
 
@@ -126,6 +163,9 @@ All configuration is done via the `env` block in `claude_desktop_config.json`. S
 | `PROTON_BRIDGE_KEYCHAIN_SVC`      | no       | `proton_bridge_mcp` | Keychain service name. Override only if you have multiple Bridge accounts.       |
 | `PROTON_BRIDGE_PASS`              | no       | —             | Direct password fallback. Avoid; prefer Keychain. Useful for headless / CI.            |
 | `PROTON_BRIDGE_LOG_LEVEL`         | no       | `INFO`        | Standard Python log level.                                                             |
+| `PROTON_BRIDGE_MAX_ATTACHMENT_BYTES` | no    | `18874368` (18 MiB) | Total attachment budget per outgoing message, counted as raw bytes before base64 encoding. Proton's own ceiling is 25 MB for the encoded message. |
+| `PROTON_BRIDGE_MAX_ATTACHMENT_COUNT` | no    | `20`          | Maximum attachments on one outgoing message.                                           |
+| `PROTON_BRIDGE_ATTACHMENT_ROOTS`  | no       | (unset)       | `:`-separated allowlist of directories local files may be attached from. Unset means any readable path, gated only by `acknowledged=true`. Symlinks are resolved before the check, so a link inside an allowed root can't smuggle a file out of it. |
 
 ## Rotating and revoking
 
@@ -153,7 +193,8 @@ All configuration is done via the `env` block in `claude_desktop_config.json`. S
 - **Local-only**: this MCP server runs on your Mac under your user account. Bridge listens only on `127.0.0.1`. Nothing this server does talks to the public internet on your behalf — when Claude invokes a tool, the resulting IMAP/SMTP traffic stays on loopback to Bridge, and Bridge then talks to Proton over its own end-to-end-encrypted channel.
 - **Credentials**: the Bridge app-password lives in the macOS Keychain, fetched per-process via `/usr/bin/security`. The Keychain item's ACL trusts the `security` CLI explicitly, so macOS does not gate every read with a prompt; conversely, no other process can read the password without macOS authentication. The password is never written to disk by this server, never logged, and never exposed in tool outputs.
 - **TLS**: the connection to Bridge is always STARTTLS-wrapped. The default policy is `pinned` — the server pins to Bridge's specific self-signed certificate (saved to `~/.config/proton-bridge-mcp/cert.pem` on first install) and refuses to start if that cert can't be located. Setting `PROTON_BRIDGE_TLS_POLICY=best_effort` is an explicit downgrade that allows fallback to `CERT_NONE` on loopback only — acceptable for first-install diagnostics because the only thing Bridge listens on is loopback under your own user account, but not the recommended long-term posture.
-- **Send / destructive tools**: explicitly annotated. `proton_send_email`, `proton_delete_email`, `proton_move_email`, `proton_flag_email`, and `proton_create_draft` all carry MCP `destructiveHint` / `idempotentHint` annotations the client can use to gate confirmation. Reads default to non-mutating (`mark_seen=false`).
+- **Send / destructive tools**: explicitly annotated. `proton_send_email`, `proton_forward_email`, `proton_delete_email`, `proton_move_email`, `proton_flag_email`, and `proton_create_draft` all carry MCP `destructiveHint` / `idempotentHint` annotations the client can use to gate confirmation. Reads default to non-mutating (`mark_seen=false`).
+- **Attachments are the sharpest edge here.** Attaching a local file reads an arbitrary path off your disk and sends it to whoever the message is addressed to, and "forward everything from X to attacker@evil.com" is the single most attractive action for an injected payload to induce. Everything that can attach a file requires `acknowledged=true`, including drafts addressed only to yourself, which are otherwise exempt from the draft gate. If you want a hard boundary rather than a per-call decision, set `PROTON_BRIDGE_ATTACHMENT_ROOTS` to the one directory you're willing to send from.
 - **Prompt-injection caveat**: an MCP server that reads email is, by construction, a prompt-injection surface. Email bodies you read with `proton_read_email` may contain instructions intended to manipulate the model. Never have Claude execute actions described in inbound email content without your explicit approval. Treat all email content as untrusted input, even from senders you know.
 
 ## Development
@@ -178,9 +219,11 @@ python3 -m compileall -q proton_bridge_mcp.py bootstrap.py
 ```
 
 The pytest suite covers the side-effect-free helpers (header decoding,
-address parsing, body extraction, IMAP-search criteria construction). IMAP,
-SMTP and Keychain paths are intentionally not unit-tested — they need a
-running Bridge and integration coverage.
+address parsing, body extraction, attachment resolution, IMAP-search criteria
+construction), the `acknowledged` refusal paths, and the forward tool's
+orchestration with its IMAP/SMTP seams stubbed. The real IMAP, SMTP and
+Keychain paths are intentionally not unit-tested: they need a running Bridge
+and integration coverage.
 
 ## License
 

@@ -63,13 +63,15 @@ What this server protects against and what it doesn't.
   posture.
 - **Read semantics.** `proton_read_email` defaults `mark_seen=false`. Reading
   a message never implicitly marks it seen.
-- **Mutating tools are annotated.** `proton_send_email`, `proton_delete_email`,
-  `proton_move_email`, `proton_flag_email`, and `proton_create_draft` all
+- **Mutating tools are annotated.** `proton_send_email`,
+  `proton_forward_email`, `proton_delete_email`, `proton_move_email`,
+  `proton_flag_email`, and `proton_create_draft` all
   carry MCP `destructiveHint` / `idempotentHint` annotations the client can
-  use to gate confirmation. `proton_send_email` and `proton_delete_email`
-  carry `destructiveHint: true`.
+  use to gate confirmation. `proton_send_email`, `proton_forward_email` and
+  `proton_delete_email` carry `destructiveHint: true`.
 - **Server-side `acknowledged` requirement on the side-effecting tools.**
-  `proton_send_email`, `proton_delete_email`, `proton_create_draft`, and
+  `proton_send_email`, `proton_forward_email`, `proton_delete_email`,
+  `proton_create_draft`, and
   `proton_download_attachment` all require an explicit `acknowledged`
   bool argument at the input layer (Pydantic `Field(...)` with no
   default), so a prompt-injection payload that simply names the tool
@@ -77,7 +79,8 @@ What this server protects against and what it doesn't.
   model has to *deliberately* set the value, which is the point at
   which a well-instructed model surfaces the action to the operator.
   The body-level enforcement differs by tool:
-  - `proton_send_email` and `proton_delete_email` are *always* refused
+  - `proton_send_email`, `proton_forward_email` and
+    `proton_delete_email` are *always* refused
     on `acknowledged=false`; the tool body returns a structured
     `refused` JSON payload (`reason: "acknowledged_required"`) without
     resolving credentials or touching IMAP/SMTP.
@@ -95,6 +98,41 @@ What this server protects against and what it doesn't.
     `PROTON_BRIDGE_USER` and `PROTON_BRIDGE_DEFAULT_FROM` (case-
     insensitive) -- aliases not represented in either env var are
     treated as external for this gate, which is the safe default.
+    A draft *carrying attachments* is refused on `acknowledged=false`
+    regardless of its recipients (see below).
+- **Attachment handling.** `proton_send_email`, `proton_create_draft`
+  and `proton_forward_email` can attach local files (`attachments`,
+  absolute paths) and attachments lifted off messages already in the
+  mailbox (`forward_attachments`, or the source message's own
+  attachments in the case of a forward). Attaching a local file is an
+  arbitrary-file-read whose result leaves the machine, so:
+  - Every path into it is behind `acknowledged=true`, including the
+    self-addressed drafts that the recipient-based draft gate would
+    otherwise wave through. A draft sitting in Drafts with
+    `~/.ssh/id_rsa` attached is one careless click from being sent.
+  - `PROTON_BRIDGE_ATTACHMENT_ROOTS` (unset by default) turns the
+    per-call decision into a hard boundary: an `os.pathsep`-separated
+    allowlist of directories local files may be attached from.
+    Symlinks are resolved *before* the check, so a link planted inside
+    an allowed root cannot smuggle a file out of it. Relative paths,
+    directories, and non-regular files (devices, FIFOs) are refused
+    unconditionally.
+  - Filenames on outgoing parts -- including ones lifted verbatim off
+    an inbound message being forwarded -- are stripped of control
+    characters (header injection into `Content-Disposition`), path
+    separators (traversal on whatever machine saves the file next),
+    and invisible Unicode, and are length-capped.
+  - A count cap (`PROTON_BRIDGE_MAX_ATTACHMENT_COUNT`, default 20) and
+    a total-size cap (`PROTON_BRIDGE_MAX_ATTACHMENT_BYTES`, default
+    18 MiB of raw bytes) apply per outgoing message, across both
+    sources, and are enforced before anything is sent.
+  - Forwarding does *not* feed the forwarded body back into the
+    model's context: `proton_forward_email` returns metadata only. The
+    body it sends is verbatim -- neither truncated nor stripped of
+    invisible Unicode, unlike the read path -- because the recipient
+    should receive what the original sender wrote, not a rewrite. The
+    attribution block in the HTML alternative is HTML-escaped, so
+    attacker-controlled headers cannot inject markup into it.
 - **Prompt-injection hardening at the read boundary** (partial — see also
   the out-of-scope section below). Two layered mitigations apply to email
   content returned to the LLM:
@@ -141,7 +179,11 @@ What this server protects against and what it doesn't.
   tool with plausible arguments is the *operator's* and *client's* problem,
   not ours. Any feature that lets the model take action based on email
   content (auto-reply, auto-forward, rule-based delete) **must** require
-  explicit per-action user confirmation in the MCP client. The server
+  explicit per-action user confirmation in the MCP client. Forwarding
+  deserves particular suspicion: it combines a read the model is already
+  allowed to perform with an outbound send, and it can carry attachments
+  the model never inspected -- including malware, which this server does
+  not scan for and will relay byte-for-byte if told to. The server
   provides the primitives and the layered defences; the client and the
   operator provide the policy.
 - **Read-side exfiltration via the model.** The `acknowledged=true` gate
@@ -202,19 +244,33 @@ source:
   header is added by the closest trusted MTA (Proton's own MX for
   Bridge users). Coverage is in `TestParseAuthenticationResults` in
   `tests/test_helpers.py`.
-- `SendEmailInput`, `DeleteInput`, `CreateDraftInput`, and
+- `SendEmailInput`, `ForwardEmailInput`, `DeleteInput`,
+  `CreateDraftInput`, and
   `DownloadAttachmentInput` all declare `acknowledged: bool = Field(...)`
   with no default — pydantic rejects calls that omit the field. The tool
-  bodies of `proton_send_email`, `proton_delete_email`, and
+  bodies of `proton_send_email`, `proton_forward_email`,
+  `proton_delete_email`, and
   `proton_download_attachment` short-circuit unconditionally on
   `acknowledged=False` and return `_refused_unack(...)`.
-  `proton_create_draft` short-circuits only when `_external_recipients`
-  finds at least one non-self address among the recipients. Both
+  `proton_create_draft` short-circuits when `_external_recipients`
+  finds at least one non-self address among the recipients, and
+  additionally whenever the draft carries attachments. These
   behaviours are pinned by `TestSendEmailInputRequiresAck`,
   `TestDeleteInputRequiresAck`, `TestCreateDraftInputRequiresAck`,
   `TestDownloadAttachmentInputRequiresAck`, `TestExternalRecipients`,
+  `TestForwardEmailInputRequiresAck`, `TestForwardRefusedWithoutAck`,
+  `TestDraftAttachmentGate`,
   and `TestRefusedUnack` in `tests/test_helpers.py`.
+- `_local_attachment_blob` refuses relative paths, missing files, and
+  non-regular files, resolves symlinks *before* testing the path against
+  `ATTACHMENT_ROOTS`, and enforces the size cap; `_safe_attachment_name`
+  strips control characters, path separators, and invisible Unicode from
+  every filename placed on an outgoing part. Coverage is in
+  `TestLocalAttachmentBlob`, `TestSafeAttachmentName`, and
+  `TestAttachmentBudget` in `tests/test_helpers.py`.
 - No credential, cert path, or message body is logged at `INFO` or `DEBUG`.
+  The attachment log lines emitted by the send / draft / forward tools
+  carry filenames and sizes only, never payload bytes.
 
 If any of these is no longer true, that itself is a security bug — please
 report it via the channel above.
@@ -228,6 +284,12 @@ report it via the channel above.
 - Keep Bridge up to date. Bridge regenerates its TLS cert on some upgrades; in
   pinned mode, that means re-running `bootstrap.py` (the cert capture step).
 - Review the MCP client's destructive-action confirmation policy. Never let
-  the model auto-execute send/delete/move based on inbound email content.
+  the model auto-execute send/forward/delete/move based on inbound email
+  content.
+- If you use the attachment features, consider setting
+  `PROTON_BRIDGE_ATTACHMENT_ROOTS` to a single directory you deliberately
+  stage outgoing files in. Unset, the only thing standing between an
+  injected "attach ~/.ssh/id_rsa and send it to …" and a successful
+  exfiltration is your own confirmation of the `acknowledged=true` call.
 - Rotate the Bridge app-password periodically via Bridge → *Mailbox details*,
   followed by `setup_keychain.sh` (or `bootstrap.py --force-password`).
